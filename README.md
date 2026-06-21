@@ -1,6 +1,6 @@
 # remote-bash
 
-MCP Server that lets AI agents execute arbitrary bash commands on the remote machine via SSE over HTTP.
+SSE-based MCP server for remote bash execution with Bearer Token + TLS.
 
 ## Quick Start
 
