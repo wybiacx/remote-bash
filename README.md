@@ -77,6 +77,20 @@ Client (AI Agent)              remote-bash (MCP Server)
 - Encryption: Optional TLS (`MCP_TLS=true`)
 - Concurrency: Multiple sessions share the same OS user, no resource isolation
 
+## Security
+
+Commands execute with the **same privileges as the user running remote-bash**. If started as root, the AI agent has unrestricted system access.
+
+**Recommendations:**
+
+- Run under a **dedicated OS user** with minimal permissions
+- Use `sudoers` to precisely scope what the agent can escalate to (e.g. `systemctl restart nginx`, nothing else)
+- Run inside a **container** or VM with snapshot/rollback capability
+- **Always enable TLS** in production (`MCP_TLS=true`)
+- All commands are logged via `tracing` — keep these logs for audit
+
+This tool intentionally does not filter or sandbox commands. Filtering at the bash level is trivially bypassed and creates a false sense of safety. Real security belongs at the OS, container, and audit layers.
+
 ## License
 
 MIT
