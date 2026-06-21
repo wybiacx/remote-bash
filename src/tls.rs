@@ -45,7 +45,7 @@ pub async fn setup_tls() -> Result<TlsSetup, Box<dyn std::error::Error>> {
                 std::fs::write(&cert_path, &cert_pem)?;
                 std::fs::write(&key_path, &key_pem)?;
                 std::fs::write(&fp_path, &fp)?;
-                tracing::info!("已生成自签名证书: {}", cert_path.display());
+                tracing::info!("generated self-signed certificate: {}", cert_path.display());
                 fp
             };
 
@@ -59,7 +59,7 @@ pub async fn setup_tls() -> Result<TlsSetup, Box<dyn std::error::Error>> {
 }
 
 fn cert_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let home = dirs::home_dir().ok_or("无法确定 HOME 目录")?;
+    let home = dirs::home_dir().ok_or("cannot determine HOME directory")?;
     Ok(home.join(CERT_DIR_NAME))
 }
 
@@ -94,7 +94,7 @@ fn compute_fingerprint_from_file(path: &PathBuf) -> Result<String, Box<dyn std::
     let certs: Vec<_> = rustls_pemfile::certs(&mut reader).collect::<Result<_, _>>()?;
 
     if certs.is_empty() {
-        return Err("证书文件中未找到证书".into());
+        return Err("no certificate found in PEM file".into());
     }
 
     let mut hasher = Sha256::new();

@@ -25,10 +25,10 @@ async fn main() {
         .init();
 
     let token = std::env::var("MCP_TOKEN").unwrap_or_else(|_| {
-        tracing::error!("MCP_TOKEN 环境变量未设置，拒绝启动");
+        tracing::error!("MCP_TOKEN not set, refusing to start");
         std::process::exit(1);
     });
-    tracing::info!("MCP_TOKEN 已设置");
+    tracing::info!("MCP_TOKEN is set");
 
     let sessions: SessionMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let port = std::env::var("MCP_PORT").unwrap_or_else(|_| "9020".into());
@@ -47,10 +47,10 @@ async fn main() {
     if use_tls {
         match tls::setup_tls().await {
             Ok(tls_setup) => {
-                tracing::info!("MCP server 正在监听 https://{}", addr);
-                tracing::info!("证书 SHA256 指纹: {}", tls_setup.cert_sha256);
+                tracing::info!("MCP server listening on https://{}", addr);
+                tracing::info!("cert SHA-256 fingerprint: {}", tls_setup.cert_sha256);
                 tracing::info!(
-                    "客户端可通过 cert_sha256 配置项进行证书绑定，防止中间人攻击"
+                    "use cert_sha256 in client config for certificate pinning to prevent MITM"
                 );
 
                 axum_server::bind_rustls(
@@ -62,12 +62,12 @@ async fn main() {
                 .unwrap();
             }
             Err(e) => {
-                tracing::error!("TLS 配置失败: {}", e);
+                tracing::error!("TLS setup failed: {}", e);
                 std::process::exit(1);
             }
         }
     } else {
-        tracing::info!("MCP server 正在监听 http://{}", addr);
+        tracing::info!("MCP server listening on http://{}", addr);
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
         axum::serve(listener, app).await.unwrap();
     }
