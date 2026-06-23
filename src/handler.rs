@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
-use tracing;
 use uuid::Uuid;
 
 use crate::executor;
@@ -125,7 +124,13 @@ pub async fn message_handler(
     if !verify_token(&state, &headers) {
         let id = parse_id_from_body(&body);
         let sid = session_id_str.and_then(|s| Uuid::parse_str(s).ok());
-        push_error(&state.sessions, sid, id, UNAUTHORIZED, "Unauthorized: invalid token");
+        push_error(
+            &state.sessions,
+            sid,
+            id,
+            UNAUTHORIZED,
+            "Unauthorized: invalid token",
+        );
         return StatusCode::ACCEPTED;
     }
 
@@ -138,7 +143,13 @@ pub async fn message_handler(
     // 3. verify session exists
     if !session::session_exists(&state.sessions, &sid).await {
         let id = parse_id_from_body(&body);
-        push_error(&state.sessions, Some(sid), id, SESSION_NOT_FOUND, "Session not found");
+        push_error(
+            &state.sessions,
+            Some(sid),
+            id,
+            SESSION_NOT_FOUND,
+            "Session not found",
+        );
         return StatusCode::ACCEPTED;
     }
 
@@ -148,7 +159,13 @@ pub async fn message_handler(
         Err(e) => {
             tracing::warn!(%body, "JSON-RPC parse error: {}", e);
             let id = parse_id_from_body(&body);
-            push_error(&state.sessions, Some(sid), id, PARSE_ERROR, &format!("Parse error: {}", e));
+            push_error(
+                &state.sessions,
+                Some(sid),
+                id,
+                PARSE_ERROR,
+                &format!("Parse error: {}", e),
+            );
             return StatusCode::ACCEPTED;
         }
     };
@@ -172,11 +189,7 @@ pub async fn message_handler(
             }
             Err(e) => {
                 if let Some(ref id) = request.id {
-                    let err_resp = JsonRpcErrorResponse::new(
-                        Some(id.clone()),
-                        e.code,
-                        e.message,
-                    );
+                    let err_resp = JsonRpcErrorResponse::new(Some(id.clone()), e.code, e.message);
                     if let Ok(json) = serde_json::to_string(&err_resp) {
                         session::send_to_session(&sessions, &sid2, json).await;
                     }
@@ -190,6 +203,7 @@ pub async fn message_handler(
 
 // ── method dispatch ──
 
+#[derive(Debug)]
 struct HandlerError {
     code: i32,
     message: String,
@@ -272,12 +286,10 @@ async fn handle_tools_call(req: &JsonRpcRequest) -> Result<Value, HandlerError> 
         });
     }
 
-    let args = params
-        .get("arguments")
-        .ok_or_else(|| HandlerError {
-            code: INVALID_PARAMS,
-            message: "Missing arguments".into(),
-        })?;
+    let args = params.get("arguments").ok_or_else(|| HandlerError {
+        code: INVALID_PARAMS,
+        message: "Missing arguments".into(),
+    })?;
 
     let command = args
         .get("command")
@@ -287,10 +299,7 @@ async fn handle_tools_call(req: &JsonRpcRequest) -> Result<Value, HandlerError> 
             message: "Missing command argument".into(),
         })?;
 
-    let timeout_secs = args
-        .get("timeout")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(30);
+    let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
 
     if command.trim().is_empty() {
         return Err(HandlerError {
@@ -309,7 +318,7 @@ async fn handle_tools_call(req: &JsonRpcRequest) -> Result<Value, HandlerError> 
             code: TIMEOUT_ERROR,
             message: format!("Command timed out after {} seconds", timeout_secs),
         })
-    } else if result.exit_code.map_or(false, |c| c != 0) {
+    } else if result.exit_code.is_some_and(|c| c != 0) {
         // Non-zero exit — still return content so the agent can see output
         Ok(json!({
             "content": content,
@@ -319,5 +328,385 @@ async fn handle_tools_call(req: &JsonRpcRequest) -> Result<Value, HandlerError> 
         Ok(json!({
             "content": content
         }))
+    }
+}
+
+// ── protocol tests ──
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{header, HeaderMap, HeaderValue};
+    use serde_json::json;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    // ── helpers for B's protocol tests ──
+    fn req(method: &str, id: Option<Value>, params: Option<Value>) -> JsonRpcRequest {
+        JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id,
+            method: method.into(),
+            params,
+        }
+    }
+
+    // ── helpers for C's security tests ──
+    fn make_state(token: &str) -> AppState {
+        AppState {
+            sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            token: token.to_string(),
+        }
+    }
+
+    fn bearer_headers(token: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(t) = token {
+            h.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", t)).unwrap(),
+            );
+        }
+        h
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // B: initialize
+    // ══════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn initialize_returns_protocol_version() {
+        let r = req("initialize", Some(json!(1)), None);
+        let result = handle_method(&r).await.unwrap();
+        assert_eq!(result["protocolVersion"], "2024-11-05");
+    }
+
+    #[tokio::test]
+    async fn initialize_returns_capabilities() {
+        let r = req("initialize", Some(json!(1)), None);
+        let result = handle_method(&r).await.unwrap();
+        let caps = &result["capabilities"];
+        assert!(caps["tools"].is_object());
+    }
+
+    #[tokio::test]
+    async fn initialize_returns_server_info() {
+        let r = req("initialize", Some(json!(1)), None);
+        let result = handle_method(&r).await.unwrap();
+        assert_eq!(result["serverInfo"]["name"], "remote-bash");
+        assert_eq!(result["serverInfo"]["version"], "0.1.0");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // B: tools/list
+    // ══════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn tools_list_returns_execute_command() {
+        let r = req("tools/list", Some(json!(1)), None);
+        let result = handle_method(&r).await.unwrap();
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "execute_command");
+    }
+
+    #[tokio::test]
+    async fn tools_list_includes_input_schema() {
+        let r = req("tools/list", Some(json!(1)), None);
+        let result = handle_method(&r).await.unwrap();
+        let tools = result["tools"].as_array().unwrap();
+        let schema = &tools[0]["inputSchema"];
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["command"].is_object());
+        assert_eq!(schema["properties"]["timeout"]["default"], 30);
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("command")));
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // B: unknown method
+    // ══════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn unknown_method_returns_method_not_found() {
+        let r = req("nonexistent/method", Some(json!(1)), None);
+        let err = handle_method(&r).await.unwrap_err();
+        assert_eq!(err.code, METHOD_NOT_FOUND);
+        assert!(err.message.contains("nonexistent/method"));
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // B: tools/call params validation
+    // ══════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn tools_call_missing_params_returns_invalid_params() {
+        let r = req("tools/call", Some(json!(1)), None);
+        let err = handle_method(&r).await.unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("Missing params"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_missing_name_returns_invalid_params() {
+        let r = req("tools/call", Some(json!(1)), Some(json!({})));
+        let err = handle_method(&r).await.unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("Missing tool name"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_missing_arguments_returns_invalid_params() {
+        let r = req(
+            "tools/call",
+            Some(json!(1)),
+            Some(json!({"name": "execute_command"})),
+        );
+        let err = handle_method(&r).await.unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("Missing arguments"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_missing_command_returns_invalid_params() {
+        let r = req(
+            "tools/call",
+            Some(json!(1)),
+            Some(json!({"name": "execute_command", "arguments": {}})),
+        );
+        let err = handle_method(&r).await.unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("Missing command argument"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_empty_command_returns_invalid_params() {
+        let r = req(
+            "tools/call",
+            Some(json!(1)),
+            Some(json!({
+                "name": "execute_command",
+                "arguments": {"command": "   "}
+            })),
+        );
+        let err = handle_method(&r).await.unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("Command must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_unknown_tool_returns_method_not_found() {
+        let r = req(
+            "tools/call",
+            Some(json!(1)),
+            Some(json!({"name": "unknown_tool"})),
+        );
+        let err = handle_method(&r).await.unwrap_err();
+        assert_eq!(err.code, METHOD_NOT_FOUND);
+        assert!(err.message.contains("Unknown tool"));
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // B: tools/call integration (safe echo)
+    // ══════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn tools_call_echo_returns_content() {
+        let r = req(
+            "tools/call",
+            Some(json!(1)),
+            Some(json!({
+                "name": "execute_command",
+                "arguments": {"command": "echo hello"}
+            })),
+        );
+        let result = handle_method(&r).await.unwrap();
+        let content = result["content"].as_array().unwrap();
+        let has_hello = content.iter().any(|c| {
+            c["type"] == "text" && c["text"].as_str().map_or(false, |t| t.contains("hello"))
+        });
+        assert!(
+            has_hello,
+            "Expected content containing 'hello', got: {}",
+            result
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // B: notification / ping
+    // ══════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn notification_initialized_returns_null() {
+        let r = req("notifications/initialized", None, None);
+        let result = handle_method(&r).await.unwrap();
+        assert!(result.is_null());
+    }
+
+    #[tokio::test]
+    async fn ping_returns_empty_object() {
+        let r = req("ping", Some(json!(1)), None);
+        let result = handle_method(&r).await.unwrap();
+        assert_eq!(result, json!({}));
+    }
+
+    #[tokio::test]
+    async fn notification_without_id_handler_still_processes() {
+        // handle_method always returns a result regardless of id presence.
+        // The message_handler caller is responsible for suppressing the
+        // response when request.id is None.
+        let r = req("ping", None, None);
+        let result = handle_method(&r).await.unwrap();
+        assert_eq!(result, json!({}));
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // C: extract_bearer_token
+    // ══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn extract_valid_bearer() {
+        let h = bearer_headers(Some("my-secret-token"));
+        assert_eq!(
+            extract_bearer_token(&h),
+            Some("my-secret-token".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_missing_header() {
+        let h = HeaderMap::new();
+        assert_eq!(extract_bearer_token(&h), None);
+    }
+
+    #[test]
+    fn extract_no_bearer_prefix() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Basic abc123"),
+        );
+        assert_eq!(extract_bearer_token(&h), None);
+    }
+
+    #[test]
+    fn extract_bearer_empty_token() {
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer "));
+        assert_eq!(extract_bearer_token(&h), Some("".to_string()));
+    }
+
+    #[test]
+    fn extract_bearer_case_sensitive() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("bearer token123"),
+        );
+        assert_eq!(extract_bearer_token(&h), None);
+    }
+
+    #[test]
+    fn extract_bearer_leading_whitespace_in_value() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer  token"), // double space
+        );
+        assert_eq!(extract_bearer_token(&h), Some(" token".to_string()));
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // C: verify_token
+    // ══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn verify_correct_token() {
+        let state = make_state("secret");
+        let h = bearer_headers(Some("secret"));
+        assert!(verify_token(&state, &h));
+    }
+
+    #[test]
+    fn verify_wrong_token() {
+        let state = make_state("secret");
+        let h = bearer_headers(Some("wrong"));
+        assert!(!verify_token(&state, &h));
+    }
+
+    #[test]
+    fn verify_no_header() {
+        let state = make_state("secret");
+        let h = HeaderMap::new();
+        assert!(!verify_token(&state, &h));
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // C: parse_id_from_body
+    // ══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_id_string() {
+        let body = r#"{"jsonrpc":"2.0","id":"req-1","method":"ping"}"#;
+        assert_eq!(
+            parse_id_from_body(body),
+            Some(Value::String("req-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_id_number() {
+        let body = r#"{"jsonrpc":"2.0","id":42,"method":"ping"}"#;
+        assert_eq!(parse_id_from_body(body), Some(serde_json::json!(42)));
+    }
+
+    #[test]
+    fn parse_id_null() {
+        // Note: parse_id_from_body returns Some(Value::Null) for "id":null,
+        // but JsonRpcRequest deserialization maps JSON null to Option::None.
+        // This semantic difference is a known design trade-off; see protocol.rs
+        // deserialize_null_id test for the serde side of this.
+        let body = r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#;
+        assert_eq!(parse_id_from_body(body), Some(Value::Null));
+    }
+
+    #[test]
+    fn parse_id_missing() {
+        let body = r#"{"jsonrpc":"2.0","method":"ping"}"#;
+        assert_eq!(parse_id_from_body(body), None);
+    }
+
+    #[test]
+    fn parse_id_malformed_json() {
+        let body = r#"not json at all"#;
+        assert_eq!(parse_id_from_body(body), None);
+    }
+
+    #[test]
+    fn parse_id_empty_body() {
+        assert_eq!(parse_id_from_body(""), None);
+    }
+
+    #[test]
+    fn parse_id_truncated_json() {
+        let body = r#"{"jsonrpc":"2.0","id":"#;
+        assert_eq!(parse_id_from_body(body), None);
+    }
+
+    #[test]
+    fn parse_id_array_body() {
+        // JSON array, not object — .get("id") on array returns None
+        let body = r#"[1,2,3]"#;
+        assert_eq!(parse_id_from_body(body), None);
+    }
+
+    #[test]
+    fn parse_id_id_is_object() {
+        let body = r#"{"jsonrpc":"2.0","id":{"nested":"val"},"method":"ping"}"#;
+        assert_eq!(
+            parse_id_from_body(body),
+            Some(serde_json::json!({"nested": "val"}))
+        );
     }
 }

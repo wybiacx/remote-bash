@@ -63,6 +63,14 @@ fn cert_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(home.join(CERT_DIR_NAME))
 }
 
+/// Compute SHA-256 fingerprint hex string from DER-encoded certificate bytes.
+pub(crate) fn fingerprint_sha256(der: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(der);
+    let hash = hasher.finalize();
+    hex::encode(hash)
+}
+
 fn generate_self_signed() -> Result<(String, String, String), Box<dyn std::error::Error>> {
     let mut params = CertificateParams::default();
     params
@@ -77,12 +85,7 @@ fn generate_self_signed() -> Result<(String, String, String), Box<dyn std::error
 
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
-
-    // SHA-256 fingerprint from DER bytes
-    let mut hasher = Sha256::new();
-    hasher.update(cert.der());
-    let hash = hasher.finalize();
-    let fp = hex::encode(hash);
+    let fp = fingerprint_sha256(cert.der());
 
     Ok((cert_pem, key_pem, fp))
 }
@@ -97,8 +100,45 @@ fn compute_fingerprint_from_file(path: &PathBuf) -> Result<String, Box<dyn std::
         return Err("no certificate found in PEM file".into());
     }
 
-    let mut hasher = Sha256::new();
-    hasher.update(certs[0].as_ref());
-    let hash = hasher.finalize();
-    Ok(hex::encode(hash))
+    Ok(fingerprint_sha256(certs[0].as_ref()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_empty_input() {
+        // SHA-256 of empty input is a well-known constant.
+        let fp = fingerprint_sha256(b"");
+        assert_eq!(
+            fp,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(fp.len(), 64);
+    }
+
+    #[test]
+    fn fingerprint_different_inputs_differ() {
+        let fp1 = fingerprint_sha256(b"hello");
+        let fp2 = fingerprint_sha256(b"world");
+        assert_ne!(fp1, fp2);
+    }
+
+    #[test]
+    fn fingerprint_output_is_lowercase_hex() {
+        let fp = fingerprint_sha256(b"test");
+        assert_eq!(fp.len(), 64);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        // hex crate default is lowercase
+        assert_eq!(fp, fp.to_lowercase());
+    }
+
+    #[test]
+    fn fingerprint_deterministic() {
+        let input = b"deterministic test input";
+        let fp1 = fingerprint_sha256(input);
+        let fp2 = fingerprint_sha256(input);
+        assert_eq!(fp1, fp2);
+    }
 }
