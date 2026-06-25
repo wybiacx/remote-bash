@@ -58,7 +58,11 @@ Executes an arbitrary bash command.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `command` | string | The command to execute (required) |
-| `timeout` | integer | Timeout in seconds, default 30 |
+| `timeout` | integer | Timeout in seconds, default 30, range 1-300 |
+
+Command output is capped at 1 MiB per stream (`stdout` and `stderr`). If output is truncated, the tool response includes a truncation marker.
+
+Requests to `/messages` are limited to 64 KiB. Slow or disconnected SSE clients may have their session closed if the pending response queue fills, so clients should reconnect and start a new session when the SSE stream ends.
 
 ## Architecture
 

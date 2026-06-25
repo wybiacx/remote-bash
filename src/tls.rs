@@ -1,6 +1,7 @@
 use axum_server::tls_rustls::RustlsConfig;
 use rcgen::{CertificateParams, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::path::PathBuf;
 
 const CERT_DIR_NAME: &str = ".remote-bash";
@@ -32,19 +33,21 @@ pub async fn setup_tls() -> Result<TlsSetup, Box<dyn std::error::Error>> {
             // Auto-generate and cache in ~/.remote-bash/
             let dir = cert_dir()?;
             std::fs::create_dir_all(&dir)?;
+            ensure_private_dir(&dir)?;
             let cert_path = dir.join(CERT_FILE);
             let key_path = dir.join(KEY_FILE);
             let fp_path = dir.join(FP_FILE);
 
             let fp = if cert_path.exists() && key_path.exists() && fp_path.exists() {
                 // Reuse existing cert
+                ensure_private_key_file(&key_path)?;
                 std::fs::read_to_string(&fp_path)?.trim().to_string()
             } else {
                 // Generate new self-signed cert
                 let (cert_pem, key_pem, fp) = generate_self_signed()?;
-                std::fs::write(&cert_path, &cert_pem)?;
-                std::fs::write(&key_path, &key_pem)?;
-                std::fs::write(&fp_path, &fp)?;
+                write_file_with_mode(&cert_path, cert_pem.as_bytes(), 0o644)?;
+                write_file_with_mode(&key_path, key_pem.as_bytes(), 0o600)?;
+                write_file_with_mode(&fp_path, fp.as_bytes(), 0o644)?;
                 tracing::info!("generated self-signed certificate: {}", cert_path.display());
                 fp
             };
@@ -61,6 +64,61 @@ pub async fn setup_tls() -> Result<TlsSetup, Box<dyn std::error::Error>> {
 fn cert_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let home = dirs::home_dir().ok_or("cannot determine HOME directory")?;
     Ok(home.join(CERT_DIR_NAME))
+}
+
+#[cfg(unix)]
+fn ensure_private_dir(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_dir(_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_private_key_file(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_key_file(_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_file_with_mode(
+    path: &PathBuf,
+    contents: &[u8],
+    mode: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(path)?;
+    file.write_all(contents)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_file_with_mode(
+    path: &PathBuf,
+    contents: &[u8],
+    _mode: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::write(path, contents)?;
+    Ok(())
 }
 
 /// Compute SHA-256 fingerprint hex string from DER-encoded certificate bytes.

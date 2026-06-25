@@ -4,7 +4,7 @@ mod protocol;
 mod session;
 mod tls;
 
-use axum::{routing::get, routing::post, Router};
+use axum::{extract::DefaultBodyLimit, routing::get, routing::post, Router};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
@@ -17,6 +17,8 @@ pub struct AppState {
     pub token: String,
 }
 
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -28,6 +30,10 @@ async fn main() {
         tracing::error!("MCP_TOKEN not set, refusing to start");
         std::process::exit(1);
     });
+    if token.trim().is_empty() {
+        tracing::error!("MCP_TOKEN is empty, refusing to start");
+        std::process::exit(1);
+    }
     tracing::info!("MCP_TOKEN is set");
 
     let sessions: SessionMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -39,6 +45,7 @@ async fn main() {
     let app = Router::new()
         .route("/sse", get(handler::sse_handler))
         .route("/messages", post(handler::message_handler))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(CorsLayer::permissive())
         .with_state(AppState { sessions, token });
 

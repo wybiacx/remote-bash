@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 // ── standard JSON-RPC error codes ──
@@ -16,15 +16,45 @@ pub const EXECUTION_ERROR: i32 = -32003;
 pub const TIMEOUT_ERROR: i32 = -32004;
 
 // ── inbound ──
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct JsonRpcRequest {
     #[allow(dead_code)]
     pub jsonrpc: String,
-    #[serde(default)]
     pub id: Option<Value>,
     pub method: String,
-    #[serde(default)]
     pub params: Option<Value>,
+}
+
+impl<'de> Deserialize<'de> for JsonRpcRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("JSON-RPC request must be an object"))?;
+
+        let jsonrpc = obj
+            .get("jsonrpc")
+            .and_then(Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("missing or invalid jsonrpc"))?
+            .to_string();
+        let method = obj
+            .get("method")
+            .and_then(Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("missing or invalid method"))?
+            .to_string();
+        let id = obj.get("id").cloned();
+        let params = obj.get("params").cloned();
+
+        Ok(Self {
+            jsonrpc,
+            id,
+            method,
+            params,
+        })
+    }
 }
 
 // ── outbound success ──
@@ -117,13 +147,9 @@ mod tests {
 
     #[test]
     fn deserialize_null_id() {
-        // serde treats JSON null as Rust None for Option<T>, so a null id
-        // is indistinguishable from a missing id at this deserialization layer.
-        // Note: this differs from parse_id_from_body() in handler.rs which
-        // works on raw serde_json::Value and would return Some(Value::Null).
         let json = r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#;
         let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.id, None);
+        assert_eq!(req.id, Some(Value::Null));
     }
 
     #[test]

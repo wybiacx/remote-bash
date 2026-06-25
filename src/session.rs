@@ -1,25 +1,50 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{
+    mpsc::{self, error::TrySendError},
+    Mutex,
+};
 use uuid::Uuid;
 
-pub type SessionMap = Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<String>>>>;
+const SESSION_BUFFER_SIZE: usize = 64;
+
+pub type SessionMap = Arc<Mutex<HashMap<Uuid, mpsc::Sender<String>>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendResult {
+    Sent,
+    Full,
+    Closed,
+    Missing,
+}
 
 /// Create a new session, returning its id and the receiver side.
-pub async fn create_session(sessions: &SessionMap) -> (Uuid, mpsc::UnboundedReceiver<String>) {
+pub async fn create_session(sessions: &SessionMap) -> (Uuid, mpsc::Receiver<String>) {
     let id = Uuid::new_v4();
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(SESSION_BUFFER_SIZE);
     sessions.lock().await.insert(id, tx);
     (id, rx)
 }
 
-/// Send a message string to a session. Returns false if the session is gone.
-pub async fn send_to_session(sessions: &SessionMap, id: &Uuid, msg: String) -> bool {
-    let map = sessions.lock().await;
-    if let Some(tx) = map.get(id) {
-        tx.send(msg).is_ok()
+/// Try to send a message string to a session without waiting for queue space.
+/// Returns whether the message was sent, the queue was full, or the session is gone.
+pub async fn send_to_session(sessions: &SessionMap, id: &Uuid, msg: String) -> SendResult {
+    let tx = {
+        let map = sessions.lock().await;
+        map.get(id).cloned()
+    };
+
+    if let Some(tx) = tx {
+        match tx.try_send(msg) {
+            Ok(()) => SendResult::Sent,
+            Err(TrySendError::Full(_)) => SendResult::Full,
+            Err(TrySendError::Closed(_)) => {
+                remove_session(sessions, id).await;
+                SendResult::Closed
+            }
+        }
     } else {
-        false
+        SendResult::Missing
     }
 }
 
@@ -61,7 +86,7 @@ mod tests {
         let sessions = new_map();
         let (id, mut rx) = create_session(&sessions).await;
         let sent = send_to_session(&sessions, &id, "hello".to_string()).await;
-        assert!(sent);
+        assert_eq!(sent, SendResult::Sent);
         let msg = rx.recv().await;
         assert_eq!(msg, Some("hello".to_string()));
     }
@@ -71,7 +96,7 @@ mod tests {
         let sessions = new_map();
         let fake_id = Uuid::new_v4();
         let sent = send_to_session(&sessions, &fake_id, "nope".to_string()).await;
-        assert!(!sent);
+        assert_eq!(sent, SendResult::Missing);
     }
 
     #[tokio::test]
@@ -100,7 +125,7 @@ mod tests {
         let (id, _rx) = create_session(&sessions).await;
         remove_session(&sessions, &id).await;
         let sent = send_to_session(&sessions, &id, "lost".to_string()).await;
-        assert!(!sent);
+        assert_eq!(sent, SendResult::Missing);
     }
 
     #[tokio::test]
@@ -109,7 +134,23 @@ mod tests {
         let (id, rx) = create_session(&sessions).await;
         drop(rx); // close receiver side
         let sent = send_to_session(&sessions, &id, "orphan".to_string()).await;
-        assert!(!sent);
+        assert_eq!(sent, SendResult::Closed);
+        assert!(!session_exists(&sessions, &id).await);
+    }
+
+    #[tokio::test]
+    async fn send_to_full_session_returns_false_and_keeps_session() {
+        let sessions = new_map();
+        let (id, _rx) = create_session(&sessions).await;
+
+        for i in 0..SESSION_BUFFER_SIZE {
+            let sent = send_to_session(&sessions, &id, format!("msg-{i}")).await;
+            assert_eq!(sent, SendResult::Sent);
+        }
+
+        let sent = send_to_session(&sessions, &id, "overflow".to_string()).await;
+        assert_eq!(sent, SendResult::Full);
+        assert!(session_exists(&sessions, &id).await);
     }
 
     #[tokio::test]

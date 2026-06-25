@@ -7,7 +7,7 @@ use futures::stream::Stream;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::convert::Infallible;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
@@ -50,15 +50,37 @@ fn push_error(
     message: &str,
 ) {
     let Some(sid) = sid else { return };
-    let Some(ref id) = id else { return };
-    let resp = JsonRpcErrorResponse::new(Some(id.clone()), code, message.to_string());
+    let resp =
+        JsonRpcErrorResponse::new(Some(id.unwrap_or(Value::Null)), code, message.to_string());
     if let Ok(json) = serde_json::to_string(&resp) {
         // fire-and-forget: if session is gone the send just fails silently
         let sessions = sessions.clone();
         let msg = json;
         tokio::spawn(async move {
-            session::send_to_session(&sessions, &sid, msg).await;
+            send_or_close_on_full(&sessions, &sid, msg).await;
         });
+    }
+}
+
+async fn send_or_close_on_full(sessions: &session::SessionMap, sid: &Uuid, msg: String) -> bool {
+    match session::send_to_session(sessions, sid, msg).await {
+        session::SendResult::Sent => true,
+        session::SendResult::Full => {
+            tracing::warn!(
+                %sid,
+                "SSE session send queue is full, closing session to avoid dropping JSON-RPC response"
+            );
+            session::remove_session(sessions, sid).await;
+            false
+        }
+        session::SendResult::Closed => {
+            tracing::debug!(%sid, "SSE session receiver is closed");
+            false
+        }
+        session::SendResult::Missing => {
+            tracing::debug!(%sid, "SSE session is missing");
+            false
+        }
     }
 }
 
@@ -93,7 +115,7 @@ pub async fn sse_handler(
         // send endpoint event first
         yield Ok(Event::default().event("endpoint").data(endpoint_url));
 
-        let mut rx_stream = UnboundedReceiverStream::new(rx);
+        let mut rx_stream = ReceiverStream::new(rx);
         while let Some(msg) = rx_stream.next().await {
             yield Ok(Event::default().event("message").data(msg));
         }
@@ -183,7 +205,7 @@ pub async fn message_handler(
                     // only respond if there's an id (not a notification)
                     let success = JsonRpcSuccess::new(Some(id.clone()), resp);
                     if let Ok(json) = serde_json::to_string(&success) {
-                        session::send_to_session(&sessions, &sid2, json).await;
+                        send_or_close_on_full(&sessions, &sid2, json).await;
                     }
                 }
             }
@@ -191,7 +213,7 @@ pub async fn message_handler(
                 if let Some(ref id) = request.id {
                     let err_resp = JsonRpcErrorResponse::new(Some(id.clone()), e.code, e.message);
                     if let Ok(json) = serde_json::to_string(&err_resp) {
-                        session::send_to_session(&sessions, &sid2, json).await;
+                        send_or_close_on_full(&sessions, &sid2, json).await;
                     }
                 }
             }
@@ -255,7 +277,9 @@ async fn handle_tools_list(_req: &JsonRpcRequest) -> Result<Value, HandlerError>
                         "timeout": {
                             "type": "integer",
                             "description": "Timeout in seconds (default 30).",
-                            "default": 30
+                            "default": executor::DEFAULT_TIMEOUT_SECS,
+                            "minimum": 1,
+                            "maximum": executor::MAX_TIMEOUT_SECS
                         }
                     },
                     "required": ["command"]
@@ -299,7 +323,29 @@ async fn handle_tools_call(req: &JsonRpcRequest) -> Result<Value, HandlerError> 
             message: "Missing command argument".into(),
         })?;
 
-    let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
+    let timeout_secs = match args.get("timeout") {
+        None => executor::DEFAULT_TIMEOUT_SECS,
+        Some(value) => {
+            let Some(timeout) = value.as_u64() else {
+                return Err(HandlerError {
+                    code: INVALID_PARAMS,
+                    message: "Timeout must be a positive integer".into(),
+                });
+            };
+
+            if timeout == 0 || timeout > executor::MAX_TIMEOUT_SECS {
+                return Err(HandlerError {
+                    code: INVALID_PARAMS,
+                    message: format!(
+                        "Timeout must be between 1 and {} seconds",
+                        executor::MAX_TIMEOUT_SECS
+                    ),
+                });
+            }
+
+            timeout
+        }
+    };
 
     if command.trim().is_empty() {
         return Err(HandlerError {
@@ -369,6 +415,23 @@ mod tests {
         h
     }
 
+    #[tokio::test]
+    async fn send_or_close_on_full_removes_overloaded_session() {
+        let sessions: session::SessionMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (sid, _rx) = session::create_session(&sessions).await;
+
+        for i in 0..64 {
+            assert_eq!(
+                session::send_to_session(&sessions, &sid, format!("msg-{i}")).await,
+                session::SendResult::Sent
+            );
+        }
+
+        let sent = send_or_close_on_full(&sessions, &sid, "overflow".to_string()).await;
+        assert!(!sent);
+        assert!(!session::session_exists(&sessions, &sid).await);
+    }
+
     // ══════════════════════════════════════════════════════════════
     // B: initialize
     // ══════════════════════════════════════════════════════════════
@@ -417,7 +480,15 @@ mod tests {
         let schema = &tools[0]["inputSchema"];
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["command"].is_object());
-        assert_eq!(schema["properties"]["timeout"]["default"], 30);
+        assert_eq!(
+            schema["properties"]["timeout"]["default"],
+            executor::DEFAULT_TIMEOUT_SECS
+        );
+        assert_eq!(schema["properties"]["timeout"]["minimum"], 1);
+        assert_eq!(
+            schema["properties"]["timeout"]["maximum"],
+            executor::MAX_TIMEOUT_SECS
+        );
         assert!(schema["required"]
             .as_array()
             .unwrap()
@@ -496,6 +567,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tools_call_zero_timeout_returns_invalid_params() {
+        let r = req(
+            "tools/call",
+            Some(json!(1)),
+            Some(json!({
+                "name": "execute_command",
+                "arguments": {"command": "echo hello", "timeout": 0}
+            })),
+        );
+        let err = handle_method(&r).await.unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("Timeout must be between"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_large_timeout_returns_invalid_params() {
+        let r = req(
+            "tools/call",
+            Some(json!(1)),
+            Some(json!({
+                "name": "execute_command",
+                "arguments": {
+                    "command": "echo hello",
+                    "timeout": executor::MAX_TIMEOUT_SECS + 1
+                }
+            })),
+        );
+        let err = handle_method(&r).await.unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("Timeout must be between"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_non_integer_timeout_returns_invalid_params() {
+        let r = req(
+            "tools/call",
+            Some(json!(1)),
+            Some(json!({
+                "name": "execute_command",
+                "arguments": {"command": "echo hello", "timeout": "slow"}
+            })),
+        );
+        let err = handle_method(&r).await.unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("Timeout must be a positive integer"));
+    }
+
+    #[tokio::test]
     async fn tools_call_unknown_tool_returns_method_not_found() {
         let r = req(
             "tools/call",
@@ -524,7 +643,7 @@ mod tests {
         let result = handle_method(&r).await.unwrap();
         let content = result["content"].as_array().unwrap();
         let has_hello = content.iter().any(|c| {
-            c["type"] == "text" && c["text"].as_str().map_or(false, |t| t.contains("hello"))
+            c["type"] == "text" && c["text"].as_str().is_some_and(|t| t.contains("hello"))
         });
         assert!(
             has_hello,
@@ -663,10 +782,8 @@ mod tests {
 
     #[test]
     fn parse_id_null() {
-        // Note: parse_id_from_body returns Some(Value::Null) for "id":null,
-        // but JsonRpcRequest deserialization maps JSON null to Option::None.
-        // This semantic difference is a known design trade-off; see protocol.rs
-        // deserialize_null_id test for the serde side of this.
+        // JSON-RPC permits null ids, so parse_id_from_body preserves "id": null.
+        // JsonRpcRequest deserialization follows the same behavior.
         let body = r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#;
         assert_eq!(parse_id_from_body(body), Some(Value::Null));
     }
